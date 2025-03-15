@@ -1,0 +1,161 @@
+import pandas as pd
+import numpy as np
+import os
+import logging
+import time
+import subprocess
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import LabelEncoder
+from ollama import chat, ChatResponse
+
+# Configure logging for debugging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Load CSV file
+file_path = "cluster_0.csv"
+
+# Max retry limit
+MAX_ATTEMPTS = 8
+attempt = 0
+
+# Define a function to validate the generated code
+def validate_generated_code(code: str) -> bool:
+    """
+    Validate that the generated code is executable and contains only code (no explanations or markdown).
+    """
+    # Check for common non-code patterns
+    if "```" in code or "python" in code or "explanation" in code.lower():
+        return False
+    # Check if the code contains necessary imports (e.g., sklearn)
+    required_imports = ["sklearn", "pandas", "numpy", "matplotlib"]
+    if not any(imp in code for imp in required_imports):
+        return False
+    return True
+
+while attempt < MAX_ATTEMPTS:
+    try:
+        logging.info(f"Attempt {attempt + 1}/{MAX_ATTEMPTS}: Loading and processing dataset...")
+
+        # Load the dataset
+        data = pd.read_csv(file_path)
+
+        # Normalize column names (strip spaces, remove newlines, convert to lowercase)
+        data.columns = data.columns.str.strip().str.replace("\n", " ").str.lower()
+
+        # Identify categorical and numeric columns dynamically
+        categorical_cols = data.select_dtypes(include=['object']).columns.tolist()
+        numeric_cols = data.select_dtypes(include=['number']).columns.tolist()
+
+        logging.info(f"Identified {len(categorical_cols)} categorical columns: {categorical_cols}")
+        logging.info(f"Identified {len(numeric_cols)} numeric columns: {numeric_cols}")
+
+        # Handle missing values
+        num_imputer = SimpleImputer(strategy="mean")  # Fill missing numeric values
+        cat_imputer = SimpleImputer(strategy="most_frequent")  # Fill missing categorical values
+
+        logging.info("Handling missing values...")
+        data[numeric_cols] = num_imputer.fit_transform(data[numeric_cols])
+        data[categorical_cols] = cat_imputer.fit_transform(data[categorical_cols])
+
+        # Convert all numeric columns explicitly
+        for col in numeric_cols:
+            data[col] = pd.to_numeric(data[col], errors='coerce')  # Convert, setting invalid values to NaN
+
+        # Encode categorical data using LabelEncoder
+        label_encoders = {}
+        for col in categorical_cols:
+            le = LabelEncoder()
+            data[col] = le.fit_transform(data[col].astype(str))  # Convert categorical strings to numbers
+            label_encoders[col] = le
+
+        # Ensure all data is numeric before clustering
+        df_cleaned = pd.DataFrame(data, columns=data.columns)
+
+        # Validate that no object columns remain
+        if not df_cleaned.select_dtypes(include=['object']).empty:
+            logging.error("Some categorical columns were not properly converted.")
+            raise ValueError("Categorical columns detected after preprocessing. Fix encoding.")
+
+        # Print final DataFrame info for debugging
+        logging.info(f"Final dataset structure:\n{df_cleaned.info()}")
+
+        # Define max CPU usage
+        LOKY_MAX_CPU_COUNT = 4
+
+        # Try different models if CodeLlama fails
+        model_options = ["codellama"]
+        model = model_options[attempt % len(model_options)]  # Rotate models on each attempt
+
+        logging.info(f"Using model: {model}")
+
+        # Generate response from the selected model
+        response: ChatResponse = chat(model=model, messages=[
+            {
+                'role': 'user',
+                'content': f"""# Only provide the code. Do not include any explanations, comments, or markdown.
+# Ensure all necessary libraries are imported.
+
+# Task: Perform clustering on 'cluster_0.csv' using sklearn.
+# Generate a detailed PDF report that includes:
+#  - Data overview
+#  - Identified clusters
+#  - Business insights and strategies based on clustering results.
+
+# Ensure proper data preprocessing:
+#  - Handle missing values to prevent ValueError: Input X contains NaN.
+#  - Convert non-numeric values appropriately to avoid ValueError: could not convert string to float.
+#  - Ensure train_test_split is correctly imported to avoid NameError: name 'train_test_split' is not defined.
+#  - Include: from sklearn.model_selection import train_test_split.
+#  - Ensure that the code runs without errors.
+
+{df_cleaned.describe()}
+""",
+            },
+        ])
+
+        # Extract the generated code
+        generated_code = response.message.content
+
+        # Validate the generated code
+        if not validate_generated_code(generated_code):
+            logging.error("Generated code contains non-code content (explanations, markdown, etc.). Retrying...")
+            raise ValueError("Invalid code generated by AI.")
+
+        # Save the generated code to a Python file
+        script_path = "cluster.py"
+        logging.info(f"Saving generated code to {script_path}")
+
+        with open(script_path, "w") as f:
+            f.write(generated_code)
+
+        # Check if the Conda environment exists
+        conda_env = "vmpy"
+        logging.info(f"Checking if Conda environment '{conda_env}' exists...")
+        result = subprocess.run(["conda", "env", "list"], capture_output=True, text=True)
+        if conda_env not in result.stdout:
+            logging.error(f"Conda environment '{conda_env}' does not exist.")
+            raise EnvironmentError(f"Conda environment '{conda_env}' not found.")
+
+        # Run the script using Conda environment (Python 3.10 in vmpy)
+        logging.info("Executing cluster.py in vmpy environment...")
+        subprocess.run(["conda", "run", "--no-capture-output", "-n", "vmpy", "python", script_path], check=True)
+
+        logging.info("✅ Script executed successfully! Exiting loop.")
+        break  # Exit loop on success
+
+    except subprocess.CalledProcessError as e:
+        logging.error(f"❌ Execution failed: {e}. Retrying...")
+    except EnvironmentError as e:
+        logging.error(f"❌ Environment error: {e}. Exiting...")
+        exit(1)
+    except ValueError as e:
+        logging.error(f"❌ Invalid code generated: {e}. Retrying...")
+    except Exception as e:
+        logging.error(f"❌ Unexpected error: {e}. Retrying...")
+
+    attempt += 1
+    time.sleep(2 ** attempt)  # Exponential backoff to avoid rapid retries
+
+if attempt == MAX_ATTEMPTS:
+    logging.error("❌ Maximum retry limit reached. Script failed to execute successfully.")
+    exit(1)
